@@ -1,0 +1,338 @@
+#!/usr/bin/env perl
+use Modern::Perl '2023';
+use autodie qw(:all);
+no warnings 'once';
+use Data::Dumper;
+use File::Basename;
+use File::Find;
+use File::Path qw(make_path);
+use File::Slurper 'read_text';
+use File::Spec;
+use File::XDG;
+use Getopt::Long qw(:config gnu_getopt auto_help auto_version);
+use Term::ANSIColor;
+use Text::Table;
+use TOML::Tiny qw(from_toml);
+
+$main::VERSION = '1.0.0';
+
+### Global variables
+my $xdg = File::XDG->new( name => 'gibman', api => 1 );
+my $config_dir = $xdg->config_home;
+my $user_config = $config_dir . '/config.toml';
+my $parsed_config = read_config();
+
+### Variables for options
+my $preset = ''; # Preset to use, as defined in user's config file
+my $args = ''; # Arguments to pass to the DOOM engine
+my $test = 0;
+my $verbose = 0; # Verbose output if true
+
+GetOptions(
+  'p|preset=s' => \$preset,
+  'a|args=s' => \$args,
+  't|test' => \$test,
+  'v|verbose' => \$verbose,
+)
+or exit(1);
+
+### Main
+init_config();
+read_config();
+if ($preset) {
+  read_preset();
+}
+
+### Subroutines
+
+### ### Printing
+
+sub error_print($error) {
+  print colored(['bold red'], 'Error: ');
+  say $error;
+  exit(1);
+}
+
+sub warning_print($warning) {
+  if ($verbose) {
+    print colored(['bold yellow'], 'Warning: ');
+    say $warning;
+  }
+}
+
+sub verbose_print($message, $type = '') {
+  if ($verbose) {
+    sub print_prefix($prefix) {
+      print colored(['bold'], "$prefix: ");
+    }
+
+    # Add a prefix to message according to type
+    if ($type eq 'config') { print_prefix("Configuration") }
+
+    # Then the message
+    say $message;
+  }
+}
+
+### ### Configuration
+
+sub init_config() {
+  if (-e $user_config) {
+    verbose_print("Found configuration file at $user_config.", 'config');
+  } else {
+    warning_print("Config file at path $user_config doesn't exist. Creating one from defaults.");
+
+    # Create directory if it doesn't exist
+    unless (-e $config_dir) {
+      make_path($config_dir)
+      and verbose_print("Successfully created $config_dir", 'config')
+      or error_print('Failed to create path at ' . $config_dir . ". $!.");
+    }
+
+    # Create file
+    open(FH, '>', $user_config) or error_print($!);
+    print FH DEFAULT_CONFIG();
+    close(FH);
+  }
+}
+
+sub read_config() {
+  my ($parsed_config, $error) = from_toml read_text($user_config);
+  if ($error) {
+    error_print("Problem parsing configuration file. $error");
+  }
+  #system("$parsed_config->{'default_engine'} -iwad $parsed_config->{'default_iwad'}");
+  return $parsed_config;
+}
+
+sub read_preset() {
+  # Check if preset actually exists
+  unless (exists $parsed_config->{'preset'}{$preset}) {
+    error_print("Specified preset $preset does not exist");
+  }
+  my $read_preset = $parsed_config->{'preset'}{$preset};
+
+  # Return defaults if entries in preset do not exist. Otherwise error.
+  sub defaults_fallback($preset_entry, $preset_default) {
+    if (defined $preset_entry) {
+      return $preset_entry;
+    } elsif (defined $preset_default) {
+      verbose_print("IWAD or engine entry in $preset not found. Falling back to default.");
+      return $preset_default;
+    } else {
+      error_print("IWAD or engine are specified in neither preset '$preset' nor default_iwad/default_engine in the configuration file. Exiting.");
+    }
+  }
+
+  # Assemble the table to display to user
+  my $table = Text::Table->new(
+    colored(['bold yellow'], 'Preset'), colored(['bold yellow'], "'$preset'")
+  );
+
+  # Iterate through WADs listed in preset
+  my @found_wads = sub {
+    if (exists $read_preset->{'wads'}) {
+      for my $wad (@{$read_preset->{'wads'}}) {
+        push(@_, find_element($wad));
+      }
+    }
+  };
+
+  my $found_iwad = search_iwad(defaults_fallback(
+      $read_preset->{'iwad'},
+      $parsed_config->{'default_iwad'}));
+  my $found_engine = search_engine(defaults_fallback(
+      $read_preset->{'engine'},
+      $parsed_config->{'default_engine'}));
+  
+  $table->load(['', colored(['italic'], "$read_preset->{'note'}")]);
+  $table->load([colored(['bold'], 'IWAD'), $found_iwad]);
+  $table->load([colored(['bold'], 'Engine'), $found_engine]);
+  print $table;
+}
+
+### ### Search and find
+
+sub search_iwad($iwad_search) {
+  # Check first if there is an absolute path to read
+  if (File::Spec->file_name_is_absolute($iwad_search)) {
+    verbose_print("Searching for file at $iwad_search");
+    unless (-e $iwad_search) {
+      error_print("File at $iwad_search does not exist.");
+    }
+    return $iwad_search;
+  }
+
+  # Otherwise look for the IWAD
+  return find_element($iwad_search);
+}
+
+sub search_engine($engine_search) {
+  # Check first if there is an absolute path to read
+  if (File::Spec->file_name_is_absolute($engine_search)) {
+    verbose_print("Searching for file at $engine_search");
+    unless (-e $engine_search) {
+      error_print("File at $engine_search does not exist.");
+    }
+    return $engine_search;
+  }
+
+  # If nothing, check if there is an associated entry in config
+  my $engine_in_config = $parsed_config->{'engine'}{$engine_search};
+  if ($engine_in_config) {
+    verbose_print("Found an entry for $engine_search in [engine] in configuration", 'config');
+    unless (File::Spec->file_name_is_absolute($engine_in_config)) {
+      error_print("Engine $engine_search specified under [engine] in configuration is not an absolute path. Note that aliases or environment variables do not count as absolute.");
+    }
+    unless (-e $engine_in_config) {
+      error_print("Engine $engine_search specified under [engine] in configuration does not exist.");
+    }
+  } else {
+    verbose_print("Found no entry associated with $engine_search in [engine] in configuration", 'config');
+  }
+
+  return $engine_in_config;
+}
+
+sub find_element($element) {
+  
+  # Check first if it is an absolute path to element 
+  if (File::Spec->file_name_is_absolute($element)) {
+    verbose_print("Checking if file at $element exists.");
+    unless (-e $element) {
+      error_print("File at $element does not exist.");
+    }
+    return $element;
+  }
+  verbose_print("$element not an absolute path. Searching for query in paths now.");
+
+  # Check that paths is not missing from config
+  unless (exists $parsed_config->{'paths'}) {
+    error_print('Entry paths not defined in config.')
+  }
+
+  # Otherwise search in paths
+  my @arr = @{$parsed_config->{'paths'}};
+  my $result = '';
+  for my $dir (@arr) {
+
+    # Warn the user if a provided path does not exist
+    unless (-d $dir) {
+      warning_print("Path $dir provided in paths either is not a directory or does not exist");
+      next;
+    }
+
+    # Warn user if recursive_search value has not been found in config
+    unless (exists $parsed_config->{'recursive_search'}) {
+      warning_print('recursive_search not found in configuration file. Defaulting to false.');
+    }
+
+    # If recursion ON
+    if ($parsed_config->{'recursive_search'}) {
+      find(sub {
+        my ($file_name, $dir, $ext) = fileparse($File::Find::name, qr/\.[^.]*/);
+        $result = $File::Find::name if (
+          lc($file_name) eq lc($element)
+          and lc($ext) eq lc('.wad')
+        )
+      }, $dir);
+    }
+    return $result if $result;
+
+    # If recursion OFF
+    chdir $dir;
+    my @files = glob("*");
+    for my $file (@files) {
+      if ($file =~ /\bwad\b/i) {
+        $result = "$dir/$file";
+        last;
+      }
+    }
+    return $result if $result;
+  }
+    
+  # If nothing is found, it's an error
+  error_print('No matching WAD/IWAD found in any of the provided paths. Check if those paths exist or contain the relevant WAD/IWADs in your query.');
+}
+
+use constant DEFAULT_CONFIG => q{# This is the default config file for gibman. Refer to README.md or man page
+# for further information on how to configure your instance of gibman.
+
+# You can specify path(s) for all IWADs and WADs, which will allow you to use
+# relative paths for IWAD and WAD entries, instead of absolute paths.
+paths = [
+  "/home/Games/SteamLibrary/steamapps/common/Doom 2/base",
+]
+
+# Whether search for contents in path(s) specified should be recursive. Can
+# make gibman very slow to launch if specified path(s) contains many files
+# and directories.
+recursive_search = false
+
+# Default IWAD to use when running gibman with no arguments or a preset that
+# does not specify an IWAD to use. The entry can be a name from the [iwad]
+# table or absolute path to an IWAD.
+default_iwad = "doom"
+
+# Default engine to use when running gibman with no arguments or a preset that
+# does not specify an engine to use. The engine can be the name as in your
+# system $PATH or absolute path name to the engine executable.
+default_engine = "gzdoom"
+
+[iwad]
+# Relative paths do not need to be exact and are case insensitive, so "doom2"
+# should work just as fine as "DOOM2.WAD". Absolute paths, on the other hand,
+# must be exact.
+doom = "doom"
+doom2 = "/path/to/DOOM2.WAD"
+tnt = ""
+plutonia = ""
+heretic = ""
+hexen = ""
+strife = ""
+
+[wad]
+# Specify WAD names and where they reside. Names can be used in preset
+# configuration. The path can be absolute, like so (as always, must be exact):
+wad1 = "/path/to/foobar.wad"
+
+# Or relative, if you have specified a WAD directory (wad_paths, see above):
+wad2 = "wad2"
+
+[engine]
+# You do not need to change anything here if your engine is already in PATH on
+# your system. If not, write down the exact path to it.
+gzdoom = ""
+zdoom = ""
+boom = "/path/to/boom"
+
+# Non-functional example preset outlined below, which you can invoke by
+# running 'gibman -p example'
+# You can omit iwad and engine values if you specified default_iwad and
+# default_engine in the preset
+# Preset names can be anything as long as they are only alphanumeric
+# characters, underscores, and hyphens
+
+[preset.example]
+iwad = "doom2"
+engine = "gzdoom"
+note = "If you got a lot of presets, you can write notes to help yourself"
+wads = [
+  # You can use paths for anonymous WADs, or names in [wad.list].
+  # Load order is top to bottom.
+  "wad1",
+  "wad2",
+  "/path/to/example.wad"
+]};
+
+=pod
+
+=over 4
+
+=item search_iwad
+
+This is some stuff
+
+=end
+
+=cut
